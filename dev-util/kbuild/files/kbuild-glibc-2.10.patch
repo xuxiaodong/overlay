@@ -1,0 +1,14 @@
+diff -ruN kBuild-0.1.5.orig/src/ash/output.h kBuild-0.1.5/src/ash/output.h
+--- kBuild-0.1.5.orig/src/ash/output.h	2009-04-08 15:21:26.000000000 -0700
++++ kBuild-0.1.5/src/ash/output.h	2009-05-28 20:38:17.000000000 -0700
+@@ -34,6 +34,10 @@
+  *	@(#)output.h	8.2 (Berkeley) 5/4/95
+  */
+ 
++/* glibc 2.10. */
++#define dprintf _dprintf
++/* done */
++
+ #ifndef OUTPUT_INCL
+ 
+ #include <stdarg.h>

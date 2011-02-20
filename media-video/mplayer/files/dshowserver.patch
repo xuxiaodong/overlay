@@ -1,0 +1,317 @@
+diff -Nur ../mplayer-orig/Makefile ./Makefile
+--- ../mplayer-orig/Makefile	2009-04-20 22:02:40.210413000 +0800
++++ ./Makefile	2009-04-28 07:51:42.937985278 +0800
+@@ -20,6 +20,7 @@
+ # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ 
+ include config.mak
++EXTRALIBS += -lrt
+ 
+ 
+ ###### variable declarations #######
+@@ -518,6 +519,7 @@
+               stream/stream_mf.c \
+               stream/stream_null.c \
+               stream/url.c \
++	      libmpcodecs/vd_dshowserver.c \
+               $(SRCS_COMMON-yes)
+ 
+ 
+diff -Nur ../mplayer-orig/libmpcodecs/vd.c ./libmpcodecs/vd.c
+--- ../mplayer-orig/libmpcodecs/vd.c	2009-04-02 17:20:48.195053000 +0800
++++ ./libmpcodecs/vd.c	2009-04-28 07:44:37.624693803 +0800
+@@ -25,6 +25,7 @@
+ extern vd_functions_t mpcodecs_vd_ffmpeg;
+ extern vd_functions_t mpcodecs_vd_theora;
+ extern vd_functions_t mpcodecs_vd_dshow;
++extern vd_functions_t mpcodecs_vd_dshowserver;
+ extern vd_functions_t mpcodecs_vd_dmo;
+ extern vd_functions_t mpcodecs_vd_vfw;
+ extern vd_functions_t mpcodecs_vd_vfwex;
+@@ -56,6 +57,7 @@
+ #ifdef CONFIG_OGGTHEORA
+ 	&mpcodecs_vd_theora,
+ #endif
++        &mpcodecs_vd_dshowserver,
+ #ifdef CONFIG_WIN32DLL
+         &mpcodecs_vd_dshow,
+         &mpcodecs_vd_dmo,
+diff -Nur ../mplayer-orig/libmpcodecs/vd_dshowserver.c ./libmpcodecs/vd_dshowserver.c
+--- ../mplayer-orig/libmpcodecs/vd_dshowserver.c	1970-01-01 08:00:00.000000000 +0800
++++ ./libmpcodecs/vd_dshowserver.c	2009-04-28 07:44:37.628028052 +0800
+@@ -0,0 +1,275 @@
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdarg.h>
++#include <semaphore.h>
++#include <sys/mman.h>
++#include <pthread.h>
++
++#include <sys/types.h>
++#include <unistd.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <time.h>
++#include <sys/wait.h>
++
++#include "config.h"
++
++#include "mp_msg.h"
++#include "help_mp.h"
++
++#include "vd_internal.h"
++
++struct vd_struct {
++  union {
++    uint32_t ret;
++    uint32_t cmd;
++  };
++  uint32_t buflen;
++  uint64_t pts;
++  uint32_t unused[8];
++} __attribute__((__packed__));
++
++enum {
++  VD_END = 1,
++  VD_DECODE = 2,
++  VD_SEEK = 3,
++  VD_HAS_BIH = 0x10000,
++  VD_VERSION_MASK = 0xFFFF,
++};
++
++#ifdef __APPLE__
++  void ALRMhandler(int sig) {
++  }
++  int sem_twait(sem_t *sem, int t) {
++    int ret;
++    alarm(t);
++    ret = sem_wait(sem);
++    printf("twait complete\n");
++    return ret;
++  }
++  void init_twait() {
++    sigset_t none;
++    struct sigaction sa;
++    sigemptyset(&none);
++    sigprocmask(SIG_SETMASK, &none, 0);
++
++    sa.sa_handler = ALRMhandler;
++    sa.sa_flags = 0;
++    sigemptyset(&sa.sa_mask);
++    sigaction(SIGALRM, &sa, 0);
++  }
++#else
++  int sem_twait(sem_t *sem, int t) {
++    struct timespec ts;
++    clock_gettime(CLOCK_REALTIME, &ts);
++    ts.tv_sec += t;
++    return(sem_timedwait(sem, &ts));
++  }
++  void init_twait() {}
++#endif
++
++static vd_info_t info = {
++	"DirectShowServer video codecs",
++	"dshowserver",
++	"Alan Nisota",
++	"based on dshow",
++	"win32 codecs"
++};
++
++LIBVD_EXTERN(dshowserver)
++typedef struct {
++    int fd;
++    void *mem;
++    char *data;
++    char *picture;
++    int picsize;
++    int pagesize;
++    sem_t *sem_rd;
++    sem_t *sem_wr;
++    struct vd_struct *vd;
++} ds_mpi_t;
++static ds_mpi_t *ds_mpi;
++
++// to set/get/query special features/parameters
++static int control(sh_video_t *sh __attribute((unused)),int cmd,void* arg __attribute((unused)),...){
++    switch(cmd){
++    case VDCTRL_RESYNC_STREAM:
++      printf("Seek now\n");
++      ds_mpi->vd->cmd = VD_SEEK; //'3' is cmd for seek
++      sem_post(ds_mpi->sem_wr);
++      sem_twait(ds_mpi->sem_rd, 10);
++      return CONTROL_TRUE;
++    case VDCTRL_QUERY_MAX_PP_LEVEL:
++	return 4;
++    case VDCTRL_QUERY_UNSEEN_FRAMES:
++	return 10;
++
++    }
++    return CONTROL_UNKNOWN;
++}
++
++static int my_system(const char *command)
++{
++    pid_t child = fork();
++
++    if (child < 0)
++    {
++        /* Fork failed */
++        return child;
++    }
++    else if (child == 0)
++    {
++        /* Child */
++        int i;
++        /* Close all open file descriptors except stdout/stderr */
++        for (i = sysconf(_SC_OPEN_MAX) - 1; i > 2; i--)
++            close(i);
++
++        /* Attach stdin to /dev/null */
++        /*
++        close(0);
++        int fd = open("/dev/null", O_RDONLY);
++        dup2(fd, 0);
++        if (fd != 0)
++            close(fd);
++        */
++        /* Run command */
++        execl("/bin/sh", "sh", "-c", command, NULL);
++        _exit(0);
++    }
++    else
++    {
++        /* Parent */
++        int status;
++
++        waitpid(child, &status, 0);
++        return status;
++    }
++
++    return 1;
++}
++    
++// init driver
++static int init(sh_video_t *sh){
++    int ret;
++    char cmd[255], shm[80], sem1[80], sem2[80];
++    uint32_t out_fmt;
++    int bpp, w, h;
++    int extra = 0;
++    int numpages = 10;
++    int memsize;
++
++    init_twait();
++    out_fmt = sh->codec->outfmt[sh->outfmtidx];
++    switch(out_fmt){
++      case IMGFMT_YUY2:
++      case IMGFMT_UYVY:
++	bpp = 16; break;
++      case IMGFMT_YV12:
++      case IMGFMT_I420:
++      case IMGFMT_IYUV:
++	bpp = 12; break;
++      case IMGFMT_YVU9:
++        bpp = 9; break;
++      default:
++        bpp = 24; break;
++    }
++    w = sh->disp_w; h = sh->disp_h;
++    snprintf(cmd, 255, "dshowserver -c %s -s %dx%d "
++             "-g %08x-%04x-%04x-%02x%02x%02x%02x%02x%02x%02x%02x "
++             "-f 0x%08x -b %d -o 0x%08x -p %d -i %x -n %d %s&",
++             sh->codec->dll, w, h,
++             (unsigned int)sh->codec->guid.f1, sh->codec->guid.f2, sh->codec->guid.f3,
++             sh->codec->guid.f4[0], sh->codec->guid.f4[1], sh->codec->guid.f4[2], sh->codec->guid.f4[3],
++             sh->codec->guid.f4[4], sh->codec->guid.f4[5], sh->codec->guid.f4[6], sh->codec->guid.f4[7],
++             (unsigned int)sh->format, bpp, out_fmt, getpid(), *(int *)pthread_self(), numpages, "");
++    snprintf(shm, 80, "/dshow_shm.%x", *(int *)pthread_self());
++    snprintf(sem1, 80, "/dshow_sem1.%x", *(int *)pthread_self());
++    snprintf(sem2, 80, "/dshow_sem2.%x", *(int *)pthread_self());
++    ds_mpi = (ds_mpi_t *) malloc(sizeof(ds_mpi_t));
++    ds_mpi->fd = shm_open(shm, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
++    ds_mpi->picsize =  w * h * bpp / 8;
++    ds_mpi->pagesize = ds_mpi->picsize + 1024;
++    memsize = sizeof(struct vd_struct) + w * h + ds_mpi->picsize + extra + ds_mpi->pagesize * numpages;
++    ftruncate(ds_mpi->fd, memsize);
++    ds_mpi->mem = mmap(NULL, memsize, PROT_READ | PROT_WRITE, MAP_SHARED, ds_mpi->fd, 0);
++    if(ds_mpi->mem == MAP_FAILED) {
++      perror("mmap");
++      return 0;
++    }
++    memset((char *)ds_mpi->mem, 0, sizeof(struct vd_struct));
++    if (extra)
++      memset((char *)ds_mpi->mem + (memsize - extra), 0, extra);
++    ds_mpi->vd = (struct vd_struct *)ds_mpi->mem;
++    ds_mpi->data = ((char *)ds_mpi->mem) + sizeof(struct vd_struct);
++    ds_mpi->picture = ds_mpi->data + w * h;
++    if(sh->bih->biWidth && sh->bih->biHeight) {
++      ds_mpi->vd->cmd |= VD_HAS_BIH; //Use embedded bih
++      memcpy(ds_mpi->data, sh->bih, sh->bih->biSize);
++    }
++    //Create read/write semaphores in locked state
++    ds_mpi->sem_wr = sem_open(sem1, O_CREAT, 0644, 0);
++    ds_mpi->sem_rd = sem_open(sem2, O_CREAT, 0644, 0);
++    my_system(cmd);
++    ret = sem_twait(ds_mpi->sem_rd, 10);
++    shm_unlink(shm);
++    sem_unlink(sem1);
++    sem_unlink(sem2);
++    if(ret != 0) {
++      printf("DirectShow filter failed");
++      return 0;
++    } else {
++      if(!mpcodecs_config_vo(sh,w,h,IMGFMT_YUY2)) return 0;
++      printf("Found DirectShow filter");
++      return 1;
++    }
++}
++
++// uninit driver
++static void uninit(sh_video_t *sh __attribute((unused))){
++    if(ds_mpi) {
++      printf("Destroying filter");
++      ds_mpi->vd->cmd = VD_END; //'1' is cmd for terminating
++      sem_post(ds_mpi->sem_wr);
++      close(ds_mpi->fd);
++      sem_close(ds_mpi->sem_wr);
++      sem_close(ds_mpi->sem_rd);
++      free(ds_mpi);
++      ds_mpi = NULL;
++    }
++}
++
++//mp_image_t* mpcodecs_get_image(sh_video_t *sh, int mp_imgtype, int mp_imgflag, int w, int h);
++
++// decode a frame
++static mp_image_t* decode(sh_video_t *sh,void* data,int len,int flags){
++   mp_image_t* mpi = NULL;
++   int ret;
++   if(len<=0) return NULL; // skipped frame
++    
++   if(flags&3) {
++      // framedrop:
++      return NULL;
++   }
++   ds_mpi->vd->cmd = VD_DECODE; //'2' is cmd for decoding
++   ds_mpi->vd->pts = (uint64_t)(sh->buffered_pts[0]*1E9);
++   memcpy(ds_mpi->data, data, len);
++   ds_mpi->vd->buflen = len;
++   sem_post(ds_mpi->sem_wr);
++   ret = sem_twait(ds_mpi->sem_rd, 10);
++   //printf("PTS (%d): %f -> %f\n", ds_mpi->vd->ret, sh->buffered_pts[0], (double)ds_mpi->vd->pts/1E9);
++   //printf("PTS (%d): %f(%d) -> %d\n", ds_mpi->vd->ret, sh->buffered_pts[0], pts-1, ds_mpi->vd->pts);
++   if(ret == 0 && ds_mpi->vd->ret && ! (ds_mpi->vd->ret & (1<<31))) {
++     if(ds_mpi->vd->pts)
++       sh->buffered_pts[0] = (double)ds_mpi->vd->pts/1E9;
++     mpi=mpcodecs_get_image(sh, MP_IMGTYPE_TEMP, 0 /*MP_IMGFLAG_ACCEPT_STRIDE*/, 
++                            sh->disp_w, sh->disp_h);
++     if(ds_mpi->vd->ret & 0x02) {
++       unsigned char page = ds_mpi->vd->ret >> 8;
++       memcpy(mpi->planes[0], ds_mpi->picture + ds_mpi->picsize + page * ds_mpi->pagesize, ds_mpi->picsize);
++     } else {
++       memcpy(mpi->planes[0], ds_mpi->picture, ds_mpi->picsize);
++     }
++   }
++   return mpi;
++}
